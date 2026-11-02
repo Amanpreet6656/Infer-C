@@ -200,12 +200,15 @@ public:
 
     /**
      * @brief Reconfigures memory capacity to accommodate the designated shape.
+     * 
+     * Applies transactional assignment: updates coordinate dimensions only after
+     * buffer allocation succeeds, providing the strong exception guarantee.
      */
     void resize(size_t rows, size_t cols, float init_val = 0.0f) {
         validate_dimensions(rows, cols);
+        m_data.assign(rows * cols, init_val);
         m_rows = rows;
         m_cols = cols;
-        m_data.assign(rows * cols, init_val);
     }
 
     /**
@@ -263,6 +266,14 @@ public:
         const size_t K = this->m_cols;
         const size_t N = other.m_cols;
 
+        // Disallow in-place pointer aliasing violating __restrict__ contracts and memory reuse
+        if (INFERC_UNLIKELY(&out == this || &out == &other)) {
+            Tensor temp;
+            matmul(other, temp);
+            out = std::move(temp);
+            return;
+        }
+
         if (INFERC_UNLIKELY(out.m_rows != M || out.m_cols != N)) {
             out.resize(M, N, 0.0f);
         } else {
@@ -295,7 +306,10 @@ public:
 
                 #pragma GCC ivdep
                 for (size_t j = 0; j < N; ++j) {
-                    res_row[j] += a0 * b0[j] + a1 * b1[j] + a2 * b2[j] + a3 * b3[j];
+                    res_row[j] += a0 * b0[j];
+                    res_row[j] += a1 * b1[j];
+                    res_row[j] += a2 * b2[j];
+                    res_row[j] += a3 * b3[j];
                 }
             }
             // Scalar epilogue handling trailing reduction elements
@@ -359,6 +373,14 @@ public:
         const size_t K = this->m_cols;
         const size_t N = weights.m_cols;
 
+        // Disallow in-place pointer aliasing violating __restrict__ contracts and memory reuse
+        if (INFERC_UNLIKELY(&out == this || &out == &weights || &out == &bias)) {
+            Tensor temp;
+            gemm_bias(weights, bias, temp);
+            out = std::move(temp);
+            return;
+        }
+
         if (INFERC_UNLIKELY(out.m_rows != M || out.m_cols != N)) {
             out.resize(M, N);
         }
@@ -393,7 +415,10 @@ public:
 
                 #pragma GCC ivdep
                 for (size_t j = 0; j < N; ++j) {
-                    c_row[j] += a0 * w0[j] + a1 * w1[j] + a2 * w2[j] + a3 * w3[j];
+                    c_row[j] += a0 * w0[j];
+                    c_row[j] += a1 * w1[j];
+                    c_row[j] += a2 * w2[j];
+                    c_row[j] += a3 * w3[j];
                 }
             }
             // Reduction epilogue
@@ -695,11 +720,26 @@ namespace activation {
                 continue;
             }
 
-            // Fallback to uniform distribution if coordinates contain exclusively negative infinity
-            if (!std::isfinite(max_val)) {
-                const float uniform = 1.0f / static_cast<float>(cols_count);
-                for (size_t j = 0; j < cols_count; ++j) {
-                    row[j] = uniform;
+            // Guard against infinite logits avoiding IEEE 754 (+Inf - +Inf) invalid operation singularities
+            if (INFERC_UNLIKELY(std::isinf(max_val))) {
+                if (max_val < 0.0f) {
+                    // All coordinates evaluated to -infinity: uniform distribution
+                    const float uniform = 1.0f / static_cast<float>(cols_count);
+                    for (size_t j = 0; j < cols_count; ++j) {
+                        row[j] = uniform;
+                    }
+                } else {
+                    // Saturated positive infinite logit: distribute unit probability across argmax coordinates
+                    size_t inf_count = 0;
+                    for (size_t j = 0; j < cols_count; ++j) {
+                        if (row[j] == max_val) {
+                            ++inf_count;
+                        }
+                    }
+                    const float inf_prob = 1.0f / static_cast<float>(inf_count);
+                    for (size_t j = 0; j < cols_count; ++j) {
+                        row[j] = (row[j] == max_val) ? inf_prob : 0.0f;
+                    }
                 }
                 continue;
             }
