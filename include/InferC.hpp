@@ -31,42 +31,23 @@ namespace inferc {
 #endif
 
 /**
- * @file InferC.hpp
- * @brief High-performance header-only neural network inference library for bare-metal and edge platforms.
- * 
- * Provides memory-safe continuous tensor representations, cache-blocked matrix operations,
- * fused feed-forward transformations, and numerically stabilized non-linear activations without
- * dynamic memory allocations on hot execution paths.
- */
-
-/**
- * @struct ModelFileHeader
- * @brief Binary serialization header for validated cross-platform model ingestion.
- * 
- * Encapsulates format metadata required to establish architecture compatibility, endianness
- * negotiation, and payload alignment prior to reading binary parameters into memory.
+ * Binary serialization header for validated cross-platform model ingestion.
  */
 #pragma pack(push, 1)
 struct ModelFileHeader {
-    uint32_t magic;      ///< Format signature token (ASCII representation: "INFC")
-    uint16_t version;    ///< Binary protocol schema version
-    uint16_t endianness; ///< Endianness validation flag (0x0102 denotes Little-Endian)
+    uint32_t magic;
+    uint16_t version;
+    uint16_t endianness;
 };
 #pragma pack(pop)
 
-static_assert(sizeof(ModelFileHeader) == 8, "ModelFileHeader binary layout must evaluate to exactly 8 octets.");
+static_assert(sizeof(ModelFileHeader) == 8, "ModelFileHeader must be exactly 8 bytes.");
 
-constexpr uint32_t EXPECTED_MAGIC      = 0x43464E49; ///< Constant token for format validation ("INFC")
-constexpr uint16_t EXPECTED_VERSION    = 1;          ///< Supported binary specification revision
-constexpr uint16_t EXPECTED_ENDIANNESS = 0x0102;     ///< Target Little-Endian wire encoding
+constexpr uint32_t EXPECTED_MAGIC      = 0x43464E49; // "INFC"
+constexpr uint16_t EXPECTED_VERSION    = 1;
+constexpr uint16_t EXPECTED_ENDIANNESS = 0x0102;     // Little-Endian
 
 namespace detail {
-    /**
-     * @brief Cold out-of-line exception dispatchers.
-     * 
-     * Separating exception construction from hot execution branches eliminates stack-frame
-     * setup and register spilling in latency-critical inner loops.
-     */
     [[noreturn]] inline void throw_out_of_range(size_t r, size_t c, size_t rows, size_t cols) {
         throw std::out_of_range("Tensor index (" + std::to_string(r) + ", " + 
                                std::to_string(c) + ") out of bounds for shape (" + 
@@ -83,15 +64,10 @@ namespace detail {
     [[noreturn]] inline void throw_overflow(const char* msg) {
         throw std::overflow_error(msg);
     }
-} // namespace detail
+}
 
 /**
- * @class Tensor
- * @brief Dense two-dimensional tensor backed by a contiguous row-major memory allocation.
- * 
- * Manages memory via RAII semantics using a standard contiguous buffer. Computations are structured
- * to leverage spatial locality and SIMD pipeline saturation, providing both checked reference
- * accessors and zero-allocation destination-passing mathematical routines.
+ * Continuous 2D dense tensor stored in row-major order.
  */
 class Tensor {
 private:
@@ -99,12 +75,6 @@ private:
     size_t m_cols;
     std::vector<float> m_data;
 
-    /**
-     * @brief Asserts mathematical dimension bounds against system pointer capacity.
-     * 
-     * Verifies that neither the coordinate product nor the aggregate byte demand exceeds
-     * std::numeric_limits<size_t>::max(), guarding against integer wrap-around vulnerabilities.
-     */
     static void validate_dimensions(size_t rows, size_t cols) {
         if (rows != 0) {
             if (cols > std::numeric_limits<size_t>::max() / rows) {
@@ -117,18 +87,8 @@ private:
     }
 
 public:
-    /**
-     * @brief Constructs an empty tensor possessing zero-dimensional bounds.
-     */
     Tensor() noexcept : m_rows(0), m_cols(0) {}
     
-    /**
-     * @brief Allocates an initialized contiguous tensor of dimension rows x cols.
-     * @param rows Dimension of primary axis (row cardinality).
-     * @param cols Dimension of secondary axis (column cardinality).
-     * @param init_val Uniform scalar applied across all allocated coordinates.
-     * @complexity O(rows * cols) time, O(rows * cols) space.
-     */
     Tensor(size_t rows, size_t cols, float init_val = 0.0f) 
         : m_rows(rows), m_cols(cols) {
         validate_dimensions(rows, cols);
@@ -139,12 +99,6 @@ public:
         m_data.resize(total_elements, init_val);
     }
 
-    /**
-     * @brief Constructs a tensor from a bracketed initializer list in row-major layout.
-     * @param rows Row cardinality.
-     * @param cols Column cardinality.
-     * @param list Initializer sequence containing exactly rows * cols scalar values.
-     */
     Tensor(size_t rows, size_t cols, std::initializer_list<float> list)
         : m_rows(rows), m_cols(cols) {
         validate_dimensions(rows, cols);
@@ -156,12 +110,6 @@ public:
         m_data.assign(list.begin(), list.end());
     }
 
-    /**
-     * @brief Constructs a tensor by copying an unmanaged flat float buffer.
-     * @param rows Row cardinality.
-     * @param cols Column cardinality.
-     * @param src Pointer to contiguous source buffer containing at least rows * cols values.
-     */
     Tensor(size_t rows, size_t cols, const float* src)
         : m_rows(rows), m_cols(cols) {
         validate_dimensions(rows, cols);
@@ -186,11 +134,6 @@ public:
     [[nodiscard]] inline float* data() noexcept { return m_data.data(); }
     [[nodiscard]] inline const float* data() const noexcept { return m_data.data(); }
 
-    /**
-     * @brief Obtains a direct pointer to the origin of the requested row.
-     * @param r Index along primary dimension.
-     * @return Raw pointer to contiguous sequence of secondary dimension scalars.
-     */
     [[nodiscard]] inline float* row(size_t r) noexcept { 
         return m_data.data() + r * m_cols; 
     }
@@ -199,10 +142,7 @@ public:
     }
 
     /**
-     * @brief Reconfigures memory capacity to accommodate the designated shape.
-     * 
-     * Applies transactional assignment: updates coordinate dimensions only after
-     * buffer allocation succeeds, providing the strong exception guarantee.
+     * Resizes tensor capacity. Coordinates are committed after allocation succeeds.
      */
     void resize(size_t rows, size_t cols, float init_val = 0.0f) {
         validate_dimensions(rows, cols);
@@ -211,12 +151,6 @@ public:
         m_cols = cols;
     }
 
-    /**
-     * @brief Subscript accessor providing boundary verification.
-     * 
-     * Uses compiler branch prediction primitives to bias code generation toward the valid
-     * coordinate pathway, routing violations to a cold out-of-line throw handler.
-     */
     inline float& operator()(size_t r, size_t c) {
         if (INFERC_UNLIKELY(r >= m_rows || c >= m_cols)) {
             detail::throw_out_of_range(r, c, m_rows, m_cols);
@@ -240,15 +174,8 @@ public:
     }
 
     /**
-     * @brief Zero-allocation matrix multiplication: out = this * other.
-     * 
-     * Evaluates general matrix product using an i-k-j loop topology with 4-way unrolling along
-     * the reduction axis. Non-aliasing pointers and vectorization pragmas permit auto-vectorization
-     * into fused multiply-add (FMA) instructions with optimal L1/L2 cache prefetching.
-     * 
-     * @param other Multiplicand tensor of geometry (K x N).
-     * @param out Pre-allocated destination tensor of geometry (M x N).
-     * @complexity O(M * K * N) time, O(1) auxiliary heap space.
+     * Zero-allocation matrix multiplication: out = this * other.
+     * Evaluates in i-k-j loop topology with 4-way unrolling along reduction axis K.
      */
     void matmul(const Tensor& other, Tensor& out) const {
         if (INFERC_UNLIKELY(this->m_cols != other.m_rows)) {
@@ -266,7 +193,7 @@ public:
         const size_t K = this->m_cols;
         const size_t N = other.m_cols;
 
-        // Disallow in-place pointer aliasing violating __restrict__ contracts and memory reuse
+        // Disallow in-place aliasing that violates __restrict__ rules
         if (INFERC_UNLIKELY(&out == this || &out == &other)) {
             Tensor temp;
             matmul(other, temp);
@@ -293,7 +220,6 @@ public:
             const float* const INFERC_RESTRICT a_row = this_ptr + i * K;
 
             size_t k = 0;
-            // 4-way loop unrolling across the reduction axis to maximize register reuse
             for (; k + 4 <= K; k += 4) {
                 const float a0 = a_row[k];
                 const float a1 = a_row[k + 1];
@@ -312,7 +238,6 @@ public:
                     res_row[j] += a3 * b3[j];
                 }
             }
-            // Scalar epilogue handling trailing reduction elements
             for (; k < K; ++k) {
                 const float a_ik = a_row[k];
                 const float* const INFERC_RESTRICT other_row = other_ptr + k * N;
@@ -325,9 +250,6 @@ public:
         }
     }
 
-    /**
-     * @brief Allocating matrix multiplication variant returning result by value.
-     */
     [[nodiscard]] Tensor matmul(const Tensor& other) const {
         if (this->m_cols != other.m_rows) {
             throw std::invalid_argument("Matrix dimension mismatch for multiplication: (" +
@@ -346,15 +268,8 @@ public:
     }
 
     /**
-     * @brief Fused GEMM + Bias transformation: out = this * weights + bias.
-     * 
-     * Bypasses intermediate zero-clearing passes by initializing accumulator registers directly
-     * from the broadcasted bias vector. Eliminates an entire DRAM read/write roundtrip.
-     * 
-     * @param weights Kernel parameter matrix (K x N).
-     * @param bias Row broadcast vector (1 x N).
-     * @param out Destination matrix (M x N).
-     * @complexity O(M * K * N) time, O(1) auxiliary heap space.
+     * Fused GEMM + Bias kernel: out = this * weights + bias.
+     * Accumulates matrix multiplication directly on top of broadcast bias vector.
      */
     void gemm_bias(const Tensor& weights, const Tensor& bias, Tensor& out) const {
         if (INFERC_UNLIKELY(this->m_cols != weights.m_rows)) {
@@ -373,7 +288,7 @@ public:
         const size_t K = this->m_cols;
         const size_t N = weights.m_cols;
 
-        // Disallow in-place pointer aliasing violating __restrict__ contracts and memory reuse
+        // Disallow in-place aliasing that violates __restrict__ rules
         if (INFERC_UNLIKELY(&out == this || &out == &weights || &out == &bias)) {
             Tensor temp;
             gemm_bias(weights, bias, temp);
@@ -398,11 +313,9 @@ public:
             float* const INFERC_RESTRICT c_row = c_ptr + i * N;
             const float* const INFERC_RESTRICT a_row = a_ptr + i * K;
 
-            // Direct vector assignment from bias eliminates dedicated clearing pass
             std::memcpy(c_row, b_ptr, N * sizeof(float));
 
             size_t k = 0;
-            // 4-way unrolling along K reduction dimension
             for (; k + 4 <= K; k += 4) {
                 const float a0 = a_row[k];
                 const float a1 = a_row[k + 1];
@@ -421,7 +334,6 @@ public:
                     c_row[j] += a3 * w3[j];
                 }
             }
-            // Reduction epilogue
             for (; k < K; ++k) {
                 const float a_ik = a_row[k];
                 const float* const INFERC_RESTRICT w_row = w_ptr + k * N;
@@ -435,9 +347,7 @@ public:
     }
 
     /**
-     * @brief In-place broadcasting bias accumulation across batch coordinates.
-     * @param bias Row vector of dimensions (1 x cols).
-     * @complexity O(rows * cols) time, O(1) auxiliary space.
+     * Broadcasts bias vector across batch coordinates.
      */
     void add_bias(const Tensor& bias) {
         if (bias.rows() != 1 || bias.cols() != this->m_cols) {
@@ -454,7 +364,6 @@ public:
         const size_t rows_count = this->m_rows;
         const size_t cols_count = this->m_cols;
 
-        // Pointer equality assertion prevents undefined behavior from restricted aliasing
         if (INFERC_UNLIKELY(this_ptr == bias_ptr)) {
             for (size_t j = 0; j < cols_count; ++j) {
                 this_ptr[j] += this_ptr[j];
@@ -473,11 +382,7 @@ public:
 };
 
 /**
- * @class DenseLayer
- * @brief Fully connected neural network transformation stage computing Y = XW + B.
- * 
- * Encapsulates learnable weight and bias tensors. Provides memory-safe binary deserialization
- * with transactional commit semantics, alongside zero-allocation feed-forward execution.
+ * Fully connected linear transformation layer (Y = XW + B).
  */
 class DenseLayer {
 private:
@@ -485,11 +390,6 @@ private:
     Tensor biases;
 
 public:
-    /**
-     * @brief Constructs an uninitialized dense layer with specified boundary geometry.
-     * @param input_dim Cardinality of input feature space.
-     * @param output_dim Cardinality of projected output space.
-     */
     DenseLayer(size_t input_dim, size_t output_dim) 
         : weights(input_dim, output_dim), biases(1, output_dim) {
         if (input_dim == 0 || output_dim == 0) {
@@ -498,20 +398,13 @@ public:
     }
 
     /**
-     * @brief Deserializes parameters from a binary stream with transactional exception safety.
-     * 
-     * Ingests header tokens, validates architecture dimensions, allocates isolated staging
-     * buffers, and verifies IEEE 754 numerical finiteness before moving buffers into active state.
-     * 
-     * @param is Readable binary input stream.
-     * @throws std::runtime_error On truncation, signature mismatch, or non-finite float detection.
+     * Deserializes layer parameters from stream with transactional commit semantics.
      */
     void load_weights(std::istream& is) {
         if (!is.good()) {
             throw std::runtime_error("Weight input stream is not open or in an invalid state.");
         }
 
-        // Header ingestion and byte-order integrity verification
         ModelFileHeader header{};
         is.read(reinterpret_cast<char*>(&header), sizeof(ModelFileHeader));
         if (is.gcount() != sizeof(ModelFileHeader) || !is) {
@@ -529,7 +422,6 @@ public:
             throw std::runtime_error("Unsupported model endianness encoding.");
         }
 
-        // Geometry specification verification
         uint32_t in_dim = 0;
         uint32_t out_dim = 0;
         is.read(reinterpret_cast<char*>(&in_dim), sizeof(uint32_t));
@@ -551,7 +443,6 @@ public:
                                      "), got (" + std::to_string(in_dim) + "x" + std::to_string(out_dim) + ").");
         }
 
-        // Byte count boundary validation preventing stream buffer overflow
         if (weights.size() > (static_cast<size_t>(std::numeric_limits<std::streamsize>::max()) / sizeof(float))) {
             throw std::overflow_error("Weights byte count exceeds stream reading capacity.");
         }
@@ -559,7 +450,6 @@ public:
             throw std::overflow_error("Biases byte count exceeds stream reading capacity.");
         }
 
-        // Transactional staging buffers to guarantee strong exception safety
         Tensor staged_weights(weights.rows(), weights.cols());
         Tensor staged_biases(biases.rows(), biases.cols());
 
@@ -589,7 +479,6 @@ public:
             }
         }
 
-        // Sanitize incoming floats to guard against poison NaN/Inf values
         for (size_t i = 0; i < staged_weights.size(); ++i) {
             if (!std::isfinite(staged_weights.data()[i])) {
                 throw std::runtime_error("Corrupted weight detected: non-finite float at index " + std::to_string(i));
@@ -601,14 +490,10 @@ public:
             }
         }
 
-        // Atomic commit via non-throwing move semantics
         weights = std::move(staged_weights);
         biases  = std::move(staged_biases);
     }
 
-    /**
-     * @brief Convenience wrapper loading model parameters from an explicit file path.
-     */
     void load_weights(const std::string& filepath) {
         std::ifstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
@@ -619,17 +504,12 @@ public:
     }
 
     /**
-     * @brief Zero-allocation forward evaluation: output = input * W + B.
-     * @param input Ingestion tensor of shape (Batch x InputDim).
-     * @param output Destination buffer of shape (Batch x OutputDim).
+     * Pre-allocated forward evaluation: output = input * W + B.
      */
     void forward(const Tensor& input, Tensor& output) const {
         input.gemm_bias(weights, biases, output);
     }
 
-    /**
-     * @brief Allocating forward evaluation returning output tensor by value.
-     */
     [[nodiscard]] Tensor forward(const Tensor& input) const {
         Tensor output(input.rows(), weights.cols());
         forward(input, output);
@@ -643,13 +523,7 @@ public:
 namespace activation {
 
     /**
-     * @brief In-place Rectified Linear Unit activation with branchless NaN preservation.
-     * 
-     * Computes f(x) = max(0, x) over contiguous memory. Replaces standard conditional jumps with
-     * branchless select operations, avoiding branch prediction penalties and enabling SIMD pipelining.
-     * 
-     * @param t Target tensor mutated in place.
-     * @complexity O(N) time, O(1) space.
+     * Branchless Rectified Linear Unit with IEEE 754 quiet NaN preservation.
      */
     inline void relu(Tensor& t) {
         float* const INFERC_RESTRICT ptr = t.data();
@@ -662,9 +536,6 @@ namespace activation {
         }
     }
 
-    /**
-     * @brief Out-of-place variant of ReLU transformation.
-     */
     [[nodiscard]] inline Tensor relu_copy(const Tensor& t) {
         Tensor result = t;
         relu(result);
@@ -672,17 +543,7 @@ namespace activation {
     }
 
     /**
-     * @brief In-place numerically stabilized Softmax activation.
-     * 
-     * Maps unconstrained logits to valid probability distributions over each row vector:
-     * \f[
-     *   P_j = \frac{e^{z_j - \max(\mathbf{z})}}{\sum_k e^{z_k - \max(\mathbf{z})}}
-     * \f]
-     * Executes in two memory passes utilizing raw row pointers, eliminating indexing checks while
-     * strictly guaranteeing protection against floating-point underflow, overflow, and division by zero.
-     * 
-     * @param t Logit tensor mutated into row-wise categorical probabilities.
-     * @complexity O(rows * cols) time, O(1) auxiliary space.
+     * Numerically stabilized Softmax with saturation boundary handling.
      */
     inline void softmax(Tensor& t) {
         if (t.rows() == 0 || t.cols() == 0) {
@@ -696,7 +557,6 @@ namespace activation {
         for (size_t i = 0; i < rows_count; ++i) {
             float* const INFERC_RESTRICT row = data_ptr + i * cols_count;
 
-            // Pass 1: Reduction to identify row maximum for exponent subtraction
             float max_val = -std::numeric_limits<float>::infinity();
             bool has_nan = false;
 
@@ -711,7 +571,6 @@ namespace activation {
                 }
             }
 
-            // Propagate quiet NaN across the coordinate axis if encountered
             if (has_nan) {
                 const float nan_val = std::numeric_limits<float>::quiet_NaN();
                 for (size_t j = 0; j < cols_count; ++j) {
@@ -720,16 +579,14 @@ namespace activation {
                 continue;
             }
 
-            // Guard against infinite logits avoiding IEEE 754 (+Inf - +Inf) invalid operation singularities
+            // Guard against saturated infinities to prevent (Inf - Inf) NaN generation
             if (INFERC_UNLIKELY(std::isinf(max_val))) {
                 if (max_val < 0.0f) {
-                    // All coordinates evaluated to -infinity: uniform distribution
                     const float uniform = 1.0f / static_cast<float>(cols_count);
                     for (size_t j = 0; j < cols_count; ++j) {
                         row[j] = uniform;
                     }
                 } else {
-                    // Saturated positive infinite logit: distribute unit probability across argmax coordinates
                     size_t inf_count = 0;
                     for (size_t j = 0; j < cols_count; ++j) {
                         if (row[j] == max_val) {
@@ -744,7 +601,6 @@ namespace activation {
                 continue;
             }
 
-            // Pass 2: Exponentiation and scalar sum accumulation
             float sum_exp = 0.0f;
             #pragma GCC ivdep
             for (size_t j = 0; j < cols_count; ++j) {
@@ -758,7 +614,6 @@ namespace activation {
                 }
             }
 
-            // Normalization phase guarding against zero-division singularities
             if (sum_exp <= 0.0f || !std::isfinite(sum_exp)) {
                 const float uniform = 1.0f / static_cast<float>(cols_count);
                 for (size_t j = 0; j < cols_count; ++j) {
@@ -774,17 +629,14 @@ namespace activation {
         }
     }
 
-    /**
-     * @brief Out-of-place variant of Softmax transformation.
-     */
     [[nodiscard]] inline Tensor softmax_copy(const Tensor& t) {
         Tensor result = t;
         softmax(result);
         return result;
     }
 
-} // namespace activation
+}
 
-} // namespace inferc
+}
 
-#endif // INFERC_HPP
+#endif
