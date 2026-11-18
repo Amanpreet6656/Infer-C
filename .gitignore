@@ -7,5 +7,7 @@ bin/
 *.o
 *.out
 
-# Python generated model weights
+# Python generated model weights and bytecode
 model_weights.bin
+__pycache__/
+*.pyc

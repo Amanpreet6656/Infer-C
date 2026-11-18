@@ -1,5 +1,7 @@
 import struct
 import random
+import sys
+import os
 
 # Binary Protocol Specification for InferC
 MODEL_MAGIC = 0x43464E49  # "INFC" (InferC binary format signature)
@@ -35,6 +37,9 @@ def export_model(filename):
     Architecture: 4 -> 16 -> 3
     """
     print(f"Initializing export to {filename}...")
+    dirname = os.path.dirname(filename)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     
     with open(filename, 'wb') as f:
         # Layer 1: Input(4) -> Hidden(16)
@@ -48,4 +53,5 @@ def export_model(filename):
 if __name__ == "__main__":
     # Ensure reproducibility for testing
     random.seed(42)
-    export_model("model_weights.bin")
+    output_filename = sys.argv[1] if len(sys.argv) > 1 else "model_weights.bin"
+    export_model(output_filename)
