@@ -24,6 +24,10 @@ namespace inferc {
     #define INFERC_LIKELY(x)   __builtin_expect(!!(x), 1)
     #define INFERC_UNLIKELY(x) __builtin_expect(!!(x), 0)
     #define INFERC_RESTRICT    __restrict__
+#elif defined(_MSC_VER)
+    #define INFERC_LIKELY(x)   (x)
+    #define INFERC_UNLIKELY(x) (x)
+    #define INFERC_RESTRICT    __restrict
 #else
     #define INFERC_LIKELY(x)   (x)
     #define INFERC_UNLIKELY(x) (x)
@@ -114,8 +118,11 @@ public:
         : m_rows(rows), m_cols(cols) {
         validate_dimensions(rows, cols);
         const size_t total_elements = rows * cols;
+        if (total_elements > 0 && src == nullptr) {
+            throw std::invalid_argument("Source buffer pointer cannot be null for non-empty tensor.");
+        }
         m_data.resize(total_elements);
-        if (total_elements > 0 && src != nullptr) {
+        if (total_elements > 0) {
             std::memcpy(m_data.data(), src, total_elements * sizeof(float));
         }
     }
@@ -179,14 +186,11 @@ public:
      */
     void matmul(const Tensor& other, Tensor& out) const {
         if (INFERC_UNLIKELY(this->m_cols != other.m_rows)) {
-            throw std::invalid_argument("Matrix dimension mismatch for multiplication: (" +
-                                       std::to_string(this->m_rows) + "x" + std::to_string(this->m_cols) +
-                                       ") cannot multiply (" +
-                                       std::to_string(other.m_rows) + "x" + std::to_string(other.m_cols) + ").");
+            detail::throw_dim_mismatch(this->m_rows, this->m_cols, other.m_rows, other.m_cols);
         }
 
         if (this->m_rows != 0 && other.m_cols > std::numeric_limits<size_t>::max() / this->m_rows) {
-            throw std::overflow_error("Result matrix dimensions overflow addressable memory.");
+            detail::throw_overflow("Result matrix dimensions overflow addressable memory.");
         }
 
         const size_t M = this->m_rows;
@@ -203,7 +207,7 @@ public:
 
         if (INFERC_UNLIKELY(out.m_rows != M || out.m_cols != N)) {
             out.resize(M, N, 0.0f);
-        } else {
+        } else if (M * N > 0) {
             std::memset(out.data(), 0, M * N * sizeof(float));
         }
 
@@ -252,14 +256,11 @@ public:
 
     [[nodiscard]] Tensor matmul(const Tensor& other) const {
         if (this->m_cols != other.m_rows) {
-            throw std::invalid_argument("Matrix dimension mismatch for multiplication: (" +
-                                       std::to_string(this->m_rows) + "x" + std::to_string(this->m_cols) +
-                                       ") cannot multiply (" +
-                                       std::to_string(other.m_rows) + "x" + std::to_string(other.m_cols) + ").");
+            detail::throw_dim_mismatch(this->m_rows, this->m_cols, other.m_rows, other.m_cols);
         }
 
         if (this->m_rows != 0 && other.m_cols > std::numeric_limits<size_t>::max() / this->m_rows) {
-            throw std::overflow_error("Result matrix dimensions overflow addressable memory.");
+            detail::throw_overflow("Result matrix dimensions overflow addressable memory.");
         }
 
         Tensor result(this->m_rows, other.m_cols, 0.0f);
@@ -273,10 +274,7 @@ public:
      */
     void gemm_bias(const Tensor& weights, const Tensor& bias, Tensor& out) const {
         if (INFERC_UNLIKELY(this->m_cols != weights.m_rows)) {
-            throw std::invalid_argument("Matrix dimension mismatch for multiplication: (" +
-                                       std::to_string(this->m_rows) + "x" + std::to_string(this->m_cols) +
-                                       ") cannot multiply (" +
-                                       std::to_string(weights.m_rows) + "x" + std::to_string(weights.m_cols) + ").");
+            detail::throw_dim_mismatch(this->m_rows, this->m_cols, weights.m_rows, weights.m_cols);
         }
         if (INFERC_UNLIKELY(bias.rows() != 1 || bias.cols() != weights.m_cols)) {
             throw std::invalid_argument("Bias dimension mismatch: expected (1x" +
@@ -304,10 +302,18 @@ public:
             return;
         }
 
+        float* const INFERC_RESTRICT c_ptr = out.data();
+        const float* const INFERC_RESTRICT b_ptr = bias.data();
+
+        if (K == 0) {
+            for (size_t i = 0; i < M; ++i) {
+                std::memcpy(c_ptr + i * N, b_ptr, N * sizeof(float));
+            }
+            return;
+        }
+
         const float* const INFERC_RESTRICT a_ptr = this->data();
         const float* const INFERC_RESTRICT w_ptr = weights.data();
-        const float* const INFERC_RESTRICT b_ptr = bias.data();
-        float* const INFERC_RESTRICT c_ptr = out.data();
 
         for (size_t i = 0; i < M; ++i) {
             float* const INFERC_RESTRICT c_row = c_ptr + i * N;
@@ -359,17 +365,20 @@ public:
             return;
         }
 
-        float* const INFERC_RESTRICT this_ptr = this->data();
-        const float* const INFERC_RESTRICT bias_ptr = bias.data();
-        const size_t rows_count = this->m_rows;
         const size_t cols_count = this->m_cols;
 
-        if (INFERC_UNLIKELY(this_ptr == bias_ptr)) {
+        // Disallow in-place aliasing before binding __restrict__ pointers
+        if (INFERC_UNLIKELY(&bias == this)) {
+            float* const data_ptr = this->data();
             for (size_t j = 0; j < cols_count; ++j) {
-                this_ptr[j] += this_ptr[j];
+                data_ptr[j] += data_ptr[j];
             }
             return;
         }
+
+        float* const INFERC_RESTRICT this_ptr = this->data();
+        const float* const INFERC_RESTRICT bias_ptr = bias.data();
+        const size_t rows_count = this->m_rows;
 
         for (size_t i = 0; i < rows_count; ++i) {
             float* const INFERC_RESTRICT row_ptr = this_ptr + i * cols_count;
@@ -501,6 +510,9 @@ public:
         }
         file.exceptions(std::ifstream::badbit);
         load_weights(file);
+        if (file.peek() != std::ifstream::traits_type::eof()) {
+            throw std::runtime_error("Unexpected trailing data found in weights file: file size exceeds expected layer payload.");
+        }
     }
 
     /**
