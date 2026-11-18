@@ -5,7 +5,7 @@
 
 using namespace inferc;
 
-int main() {
+int main(int argc, char* argv[]) {
     std::cout << "[INFO] Initializing InferC Engine...\n";
 
     constexpr size_t INPUT_DIM  = 4;
@@ -17,11 +17,18 @@ int main() {
         DenseLayer layer1(INPUT_DIM, HIDDEN_DIM);
         DenseLayer layer2(HIDDEN_DIM, OUTPUT_DIM);
 
-        std::cout << "[INFO] Loading weights from model_weights.bin...\n";
-        std::ifstream weight_file("model_weights.bin", std::ios::binary);
+        std::string weight_path = "model_weights.bin";
+        if (argc > 1) {
+            weight_path = argv[1];
+        } else if (!std::ifstream(weight_path).good() && std::ifstream("bin/model_weights.bin").good()) {
+            weight_path = "bin/model_weights.bin";
+        }
+
+        std::cout << "[INFO] Loading weights from " << weight_path << "...\n";
+        std::ifstream weight_file(weight_path, std::ios::binary);
         
         if (!weight_file.is_open()) {
-            std::cerr << "[ERROR] Could not open model_weights.bin! Run the Python export script first.\n";
+            std::cerr << "[ERROR] Could not open " << weight_path << "! Run the Python export script first.\n";
             return 1;
         }
 
@@ -30,8 +37,7 @@ int main() {
         layer1.load_weights(weight_file);
         layer2.load_weights(weight_file);
 
-        char trailing_byte = 0;
-        if (weight_file.read(&trailing_byte, 1) || !weight_file.eof()) {
+        if (weight_file.peek() != std::ifstream::traits_type::eof()) {
             throw std::runtime_error("Unexpected trailing data found in weights file: file size exceeds expected model payload.");
         }
         weight_file.close();
