@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -28,8 +28,13 @@ jobs:
           make clean
           make run CXX=${{ matrix.compiler }}
 
+      - name: Run numerical tolerance and invariant tests
+        run: |
+          make test CXX=${{ matrix.compiler }}
+
       - name: Memory and bounds verification (ASan + UBSan)
         if: matrix.compiler == 'clang++'
         run: |
           make clean
           make run CXX=clang++ OPTFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          make test CXX=clang++ OPTFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"

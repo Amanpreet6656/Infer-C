@@ -1,10 +1,9 @@
-# Compiler settings - standard C++17
+﻿# Compiler settings - standard C++17
 CXX ?= g++
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -pedantic -Wno-unused-parameter
 PYTHON ?= python3
 
 # Hardware optimization flags (optional but recommended for Edge/Inference)
-# -march=native tells the compiler to optimize using the host CPU's instruction set (AVX, SSE)
 OPTFLAGS = -march=native
 
 # Directories
@@ -16,6 +15,8 @@ BIN_DIR = ./bin
 # Target executable and model weights
 TARGET = $(BIN_DIR)/infer_engine
 WEIGHTS = $(BIN_DIR)/model_weights.bin
+TEST_TARGET = $(BIN_DIR)/test_tolerance
+BENCH_TARGET = $(BIN_DIR)/benchmark
 
 # Sources and Objects
 SOURCES = $(wildcard $(SRC_DIR)/*.cpp)
@@ -32,6 +33,20 @@ $(TARGET): $(OBJECTS) | directories
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | directories
 	$(CXX) $(CXXFLAGS) $(OPTFLAGS) $(INCLUDES) -c $< -o $@
 
+# Testing
+$(TEST_TARGET): tests/test_tolerance.cpp | directories
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) $(INCLUDES) $< -o $@
+
+test: $(TEST_TARGET)
+	@./$(TEST_TARGET)
+
+# Benchmarking
+$(BENCH_TARGET): benchmarks/benchmark.cpp | directories
+	$(CXX) $(CXXFLAGS) $(OPTFLAGS) $(INCLUDES) $< -o $@
+
+benchmark: $(BENCH_TARGET)
+	@./$(BENCH_TARGET)
+
 # Utility targets
 directories:
 	@mkdir -p $(OBJ_DIR)
@@ -43,10 +58,10 @@ $(WEIGHTS): scripts/export_weights.py | directories
 
 clean:
 	rm -rf $(OBJ_DIR) $(BIN_DIR)
-	rm -f model_weights.bin
+	rm -f model_weights.bin *.exe
 
 # Run the inference engine
 run: all
 	@cd $(BIN_DIR) && ./infer_engine
 
-.PHONY: all clean directories run
+.PHONY: all clean directories run test benchmark
