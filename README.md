@@ -1,5 +1,7 @@
 # InferC
 
+[![CI](https://github.com/Amanpreet6656/Infer-C/actions/workflows/ci.yml/badge.svg)](https://github.com/Amanpreet6656/Infer-C/actions/workflows/ci.yml)
+
 InferC is a lightweight, header-only C++17 inference engine designed for deploying small feed-forward neural networks to resource-constrained edge systems and embedded microprocessors. The library has zero external dependencies, avoiding BLAS abstractions, Eigen, or runtime frameworks. Core tensor math, cache-conscious matrix operations, and floating-point activations are implemented directly on top of the standard library, prioritizing deterministic latency, zero dynamic heap allocations on the hot path, and verified memory safety.
 
 ## Mathematical Architecture
