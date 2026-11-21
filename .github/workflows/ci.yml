@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-and-test:
+    name: Build & Verify (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [g++, clang++]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build engine and execute sample inference
+        run: |
+          make clean
+          make run CXX=${{ matrix.compiler }}
+
+      - name: Memory and bounds verification (ASan + UBSan)
+        if: matrix.compiler == 'clang++'
+        run: |
+          make clean
+          make run CXX=clang++ OPTFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
