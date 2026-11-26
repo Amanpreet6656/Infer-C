@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -31,6 +31,10 @@ jobs:
       - name: Run numerical tolerance and invariant tests
         run: |
           make test CXX=${{ matrix.compiler }}
+
+      - name: Run GEMM benchmark suite
+        run: |
+          make benchmark CXX=${{ matrix.compiler }} OPTFLAGS=""
 
       - name: Memory and bounds verification (ASan + UBSan)
         if: matrix.compiler == 'clang++'

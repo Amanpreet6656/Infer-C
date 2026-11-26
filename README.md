@@ -1,12 +1,18 @@
-﻿# InferC
+# InferC
 
 [![CI](https://github.com/Amanpreet6656/Infer-C/actions/workflows/ci.yml/badge.svg)](https://github.com/Amanpreet6656/Infer-C/actions/workflows/ci.yml)
 
-InferC is a lightweight, header-only C++17 inference engine designed for deploying small feed-forward neural networks to resource-constrained edge systems and embedded microprocessors. The library has zero external dependencies, avoiding BLAS abstractions, Eigen, or runtime frameworks. Core tensor math, cache-conscious matrix operations, and floating-point activations are implemented directly on top of the standard library, prioritizing deterministic latency, zero dynamic heap allocations on the hot path, and verified memory safety.
+InferC is a lightweight, header-only C++17 feed-forward neural network inference library designed for CPU inference without external dependencies (no BLAS, Eigen, or runtime ML frameworks). Core tensor operations, cache-conscious dense matrix multiplication, and floating-point activations are built solely on the C++17 Standard Library, prioritizing predictable buffer reuse, numerical stability, and verified memory safety.
+
+## Scope & Design Boundaries
+
+- **Implemented Primitives:** Contiguous row-major 2D `Tensor`, `DenseLayer` (`gemm_bias` forward pass), branchless `relu`, and overflow-guarded `softmax`.
+- **Execution Model:** Supports a destination-passing API (`layer.forward(input, output)`) to avoid repeated heap allocations on the inference hot path once destination tensors are sized. Note that `Tensor` stores weights in `std::vector<float>` and reports invalid formats via C++ exceptions, targeting hosted edge CPUs rather than exception-free bare-metal microcontrollers.
+- **Sample Exporter (`scripts/export_weights.py`):** Generates deterministic synthetic weights (`random.seed(42)`) for a 2-layer `4 -> 16 -> 3` MLP to validate binary serialization, numerical tolerances, and smoke tests.
 
 ## Mathematical Architecture
 
-The engine models standard multilayer perceptrons through sequential affine projections and non-linear mappings.
+The library models multilayer perceptrons through sequential affine projections and non-linear activations.
 
 ### Fully Connected Layers
 
@@ -14,67 +20,27 @@ For an input activation matrix $X \in \mathbb{R}^{M \times K}$, weight matrix $W
 
 $$Y = X \cdot W + B$$
 
-where $M$ denotes batch size, $K$ represents input features, and $N$ represents output features. In conventional implementations, matrix multiplication and bias addition are separated into two distinct passes: an initial matrix multiplication call followed by an elementwise accumulation pass over $Y$. This approach forces intermediate tensor values back out to memory before reloading them for bias addition.
-
-InferC implements a fused linear transformation. The output tensor $Y$ is initialized directly from the broadcast bias vector $B$, after which the matrix product is accumulated directly into the resident cache lines:
+where $M$ denotes batch size, $K$ represents input features, and $N$ represents output features. Rather than running matrix multiplication followed by a separate pass over $Y$ to add $B$, `gemm_bias` initializes each output row directly from the bias vector $B$ and accumulates the matrix product into the output buffer:
 
 $$Y_{i, j} = B_j + \sum_{k=0}^{K-1} X_{i, k} \cdot W_{k, j}$$
 
-This cuts the required memory bandwidth for intermediate activations in half and eliminates the need for scratchpad buffers.
-
 ### Non-Linear Activations
 
-Rectified Linear Unit (ReLU) activations compute $f(x) = \max(0, x)$ across the tensor. In naive implementations, branching statements such as `if (x > 0)` cause frequent branch mispredictions when processing activations near zero. InferC avoids this overhead by using a branchless ternary selection that preserves IEEE 754 quiet NaN values while compiling down to single conditional move or vector blend instructions (`vblendvps`).
+Rectified Linear Unit (ReLU) computes $f(x) = \max(0, x)$ using a branchless ternary selection that preserves IEEE 754 quiet NaN values.
 
 Softmax normalization converts unconstrained real logits $\mathbf{z} \in \mathbb{R}^{N}$ into normalized probabilities:
 
 $$P_j = \frac{e^{z_j - \max(\mathbf{z})}}{\sum_{k=0}^{N-1} e^{z_k - \max(\mathbf{z})}}$$
 
-Subtracting the maximum coordinate $\max(\mathbf{z})$ bounds the exponents to $(-\infty, 0]$, ensuring that `std::exp` cannot overflow the IEEE 754 single-precision range ($x > 88.7228$). The reduction handles saturated boundary conditions explicitly. If a row contains saturated positive infinite logits, evaluating $(\infty - \infty)$ directly would yield an invalid operation resulting in NaN. InferC detects infinite coordinates prior to exponentiation: if $+\infty$ is present, probability mass is distributed uniformly across the maximal infinite indices, while all finite coordinates receive zero. If all coordinates evaluate to $-\infty$, the output smoothly degrades to a uniform distribution $P_j = 1/N$.
+Subtracting $\max(\mathbf{z})$ bounds exponents to $(-\infty, 0]$ to prevent IEEE 754 single-precision overflow. Saturated $+\infty$ rows distribute probability mass uniformly across maximal infinite indices; all-$-\infty$ rows fall back to a uniform distribution $1/N$; `NaN` entries propagate explicitly.
 
-## Hardware Optimization and Memory Model
+## Cache Topology and Memory Safety
 
-Dense matrix multiplication scales with time complexity $\mathcal{O}(M \cdot K \cdot N)$. On modern hardware, execution throughput is primarily bounded by memory bandwidth and cache hierarchy efficiency rather than raw arithmetic capability.
-
-### Cache Topology and Loop Scheduling
-
-Memory in `inferc::Tensor` is laid out in contiguous row-major order, where element $(r, c)$ resides at index $r \cdot \text{cols} + c$. A naive loop order of $i \to j \to k$ traverses the weight matrix along its columns, producing stride-$N$ memory accesses that miss cache lines on almost every read.
-
-InferC organizes matrix multiplication into an $i \to k \to j$ iteration topology. In this configuration, index $j$ runs along the innermost loop, allowing the processor to stream both the weight matrix rows $W_{k, :}$ and the destination rows $Y_{i, :}$ sequentially with stride-1 spatial locality. Hardware prefetchers can easily track these contiguous memory accesses, keeping the CPU pipelines consistently fed from L1/L2 cache.
-
-### Vectorization and Register Reuse
-
-The reduction loop along dimension $K$ is unrolled 4-way. During each step, four scalars from the input row are kept in CPU registers while the inner loop updates the output vector across multiple independent multiply-accumulate chains. Pointers are annotated with non-aliasing `__restrict__` qualifiers and decorated with `#pragma GCC ivdep` loop hints. This allows GCC and Clang to autovectorize the inner loops into packed 256-bit AVX2 or ARM NEON fused multiply-add (FMA) instructions, retiring multiple floating-point operations per cycle without register spilling.
-
-### Zero-Allocation Forward Passes
-
-Dynamic memory allocation during execution introduces unpredictable latency spikes, heap fragmentation, and allocator lock contention. InferC provides a destination-passing execution API where destination buffers are allocated once during system startup and reused across inference cycles.
-
-Calls to `layer.forward(input, output)` operate with $\mathcal{O}(1)$ auxiliary heap memory overhead. Temporary state buffers are never constructed or destroyed inside the inference loop, making execution timing deterministic and safe for hard real-time threads.
-
-## Memory Safety and Robustness
-
-Writing high-performance C++ requires explicit defenses against edge-case undefined behavior and silent numerical corruption.
-
-### Aliasing and In-Place Operations
-
-Pointers marked with `__restrict__` promise the compiler that their target memory does not overlap with any other active pointer in scope. If a caller passes the same tensor as both input and output (for example, `layer.forward(tensor, tensor)`), writing to the output while reading from the input violates the restrict contract and triggers undefined compiler behavior under `-O3`. If the layer dimensions differ, resizing the destination buffer will deallocate the input memory while it is being read, resulting in a use-after-free.
-
-InferC performs runtime identity checks on buffer pointers inside `matmul` and `gemm_bias`. If self-aliasing is detected, execution routes through a temporary buffer before moving the result into place, guaranteeing safety while preserving an in-place API surface.
-
-### Exception Safety Guarantees
-
-All state mutations satisfy the strong exception safety guarantee. In `Tensor::resize`, dimensions `m_rows` and `m_cols` are only updated after the underlying `std::vector::assign` completes successfully. If an allocation throws `std::bad_alloc`, the tensor retains its previous valid dimensions and buffer, preventing corrupted state where dimension metadata falls out of sync with allocated memory.
-
-Similarly, `DenseLayer::load_weights` stages all incoming data into temporary buffers. Streams are validated for correct magic headers, architecture endianness, dimension conformity, and finite float values before any data is moved into the active layer. If reading fails midway through a file, the layer remains in its previous valid state.
-
-### Numerical Invariants and Bounds
-
-Coordinate calculations guard against integer overflow. Multiplications such as `rows * cols` and aggregate byte sizes are validated against `std::numeric_limits<size_t>::max()` prior to allocation. Coordinate lookups via `operator()(r, c)` verify boundaries using branch prediction hints (`[[unlikely]]`) that keep out-of-bounds error handling out of the instruction cache on the hot path.
+- **Loop Ordering (`i -> k -> j`):** `inferc::Tensor` stores elements in contiguous row-major order. Organizing dense multiplication as `i -> k -> j` streams both weight rows $W_{k, :}$ and output rows $Y_{i, :}$ sequentially with stride-1 locality.
+- **Unrolling & Aliasing Guards:** The inner reduction loop is unrolled 4-way along $K$ with `INFERC_RESTRICT` pointer qualifiers and `INFERC_IVDEP` loop hints (guarded for GCC). Before binding restrict pointers, `matmul`, `gemm_bias`, and `add_bias` check pointer identity at runtime (`&out == this`, etc.) and stage through a temporary tensor if aliasing occurs.
+- **Exception Safety & Overflow Checks:** `Tensor::validate_dimensions` guards against `size_t` multiplication overflow prior to allocation. `Tensor::resize` commits dimensions only after `std::vector::assign` succeeds. `DenseLayer::load_weights` verifies little-endian host ordering, magic/version/endianness headers, dimensions, and `std::isfinite` across all weights and biases in staged buffers before moving them into the layer.
 
 ## Binary Serialization Protocol
-
-Model parameters are loaded using a clean, packed binary format:
 
 ```
 Offset  Type      Field       Description
@@ -83,39 +49,20 @@ Offset  Type      Field       Description
 0x06    uint16_t  endianness  Endian marker (0x0102 for Little-Endian)
 0x08    uint32_t  in_dim      Input feature dimension
 0x0C    uint32_t  out_dim     Output feature dimension
-0x10    float[]   weights     Contiguous weight array (in_dim * out_dim floats)
-var     float[]   biases      Contiguous bias array (out_dim floats)
+0x10    float[]   weights     Contiguous IEEE-754 float32 weights (in_dim * out_dim)
+var     float[]   biases      Contiguous IEEE-754 float32 biases (out_dim)
 ```
 
-Every weight and bias value is scanned during loading using `std::isfinite`. Corrupted or uninitialized values such as NaN or infinity in the weight file trigger immediate exceptions rather than poisoning runtime inference.
+## Verification and Benchmarking
 
-## Empirical Performance Benchmarks
+All verification checks and benchmarks are executed automatically in GitHub Actions across both `g++` and `clang++` (including AddressSanitizer and UndefinedBehaviorSanitizer runs).
 
-To validate the efficiency of the cache-aware matrix multiplication and fused bias addition kernel, empirical benchmarks were executed comparing InferC against a baseline naive three-loop (i-j-k) GEMM with a decoupled bias accumulation pass.
-
-### Test Environment
-- **Host CPU:** AMD Ryzen 5 5500H (Zen 3 microarchitecture, 4 cores / 8 threads, 3.30 GHz base clock, 8 MB shared L3 cache)
-- **Toolchain:** GCC 16.2 / Clang with `-std=c++17 -O3 -march=native`
-- **Compiler Optimizations:** Loop interchange (i-k-j), 4-way loop unrolling along reduction axis K, `#pragma GCC ivdep` auto-vectorization, and `__restrict__` memory aliasing guarantees.
-
-### Benchmark Results
-
-| Matrix Geometry (MxKxN) | Layer Context | Iterations | Naive GEMM (us) | InferC Kernel (us) | Speedup | Max Absolute Error (epsilon) | Sustained GFLOPS |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **16x64x32** | Micro-batch edge inference | 10,000 | 18.23 us | **2.86 us** | **6.37x** | 2.38e-06 | 22.93 GFLOPS |
-| **64x128x128** | Dense hidden layer pass | 5,000 | 1,268.00 us | **74.94 us** | **16.92x** | 4.77e-06 | 27.98 GFLOPS |
-| **128x256x256** | Large batch edge projection | 1,000 | 12,042.62 us | **651.90 us** | **18.47x** | 8.58e-06 | 25.74 GFLOPS |
-| **256x256x256** | Standard square benchmark | 500 | 21,057.01 us | **1,157.68 us** | **18.19x** | 1.14e-05 | 28.98 GFLOPS |
-
-### Architectural Analysis of Speedup
-
-1. **Elimination of Strided Memory Access:** Naive triple-loop multiplication (i-j-k) iterates over the rows of matrix B along its inner loop, incurring a memory stride of N * sizeof(float) on every single multiply-accumulate operation. This exhausts L1 cache lines almost immediately. InferC utilizes an i-k-j loop interchange, allowing the inner loop to stream contiguously along resident cache lines for both matrix B and the destination row accumulator.
-2. **In-Register Bias Fusion:** In decoupled pipelines, the intermediate matrix product X * W is committed to dynamic memory, only to be immediately reloaded for bias vector addition Y + B. InferC initializes the destination register line directly with the broadcast bias elements, accumulating matrix products directly in-place and halving the required memory bus transactions.
-3. **Numerical Equivalence:** In all benchmarked configurations, maximum divergence remained within single-precision floating-point roundoff tolerances (epsilon < 1.2e-5), satisfying rigorous numerical equivalence constraints.
+- **`tests/test_tolerance.cpp`:** Verifies fused `gemm_bias` and `matmul` against scalar reference math (including non-multiple-of-4 reduction dimensions), `add_bias`, ReLU quiet-NaN preservation, Softmax stability/saturation edge cases, dimension mismatch exceptions, in-place self-aliasing, and binary deserialization error rejection.
+- **`benchmarks/benchmark.cpp`:** Compares the fused `i-k-j` kernel against a baseline `i-j-k` GEMM + separate bias pass across `16x64x32`, `64x128x128`, `128x256x256`, and `256x256x256` matrices with numerical equivalence assertions (`max_diff < 1e-4`).
 
 ## Building and Running
 
-The codebase requires a C++17 compliant compiler (`g++` 9.0+ or `clang++` 10.0+), GNU Make, and Python 3.8+ (used by the offline weight exporter).
+Requires a C++17 compiler (`g++` 9.0+ or `clang++` 10.0+), GNU Make, and Python 3.8+.
 
 ```bash
 git clone https://github.com/Amanpreet6656/Infer-C.git
@@ -125,10 +72,10 @@ cd Infer-C
 make
 make run
 
-# Run mathematical tolerance and invariant tests
+# Run numerical tolerance and invariant tests
 make test
 
-# Run empirical performance benchmarks
+# Run local GEMM benchmark
 make benchmark
 ```
 

@@ -20,18 +20,26 @@
 
 namespace inferc {
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__)
     #define INFERC_LIKELY(x)   __builtin_expect(!!(x), 1)
     #define INFERC_UNLIKELY(x) __builtin_expect(!!(x), 0)
     #define INFERC_RESTRICT    __restrict__
+    #define INFERC_IVDEP       _Pragma("GCC ivdep")
+#elif defined(__clang__)
+    #define INFERC_LIKELY(x)   __builtin_expect(!!(x), 1)
+    #define INFERC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+    #define INFERC_RESTRICT    __restrict__
+    #define INFERC_IVDEP
 #elif defined(_MSC_VER)
     #define INFERC_LIKELY(x)   (x)
     #define INFERC_UNLIKELY(x) (x)
     #define INFERC_RESTRICT    __restrict
+    #define INFERC_IVDEP
 #else
     #define INFERC_LIKELY(x)   (x)
     #define INFERC_UNLIKELY(x) (x)
     #define INFERC_RESTRICT
+    #define INFERC_IVDEP
 #endif
 
 /**
@@ -46,6 +54,8 @@ struct ModelFileHeader {
 #pragma pack(pop)
 
 static_assert(sizeof(ModelFileHeader) == 8, "ModelFileHeader must be exactly 8 bytes.");
+static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
+              "InferC requires IEEE-754 32-bit binary floats.");
 
 constexpr uint32_t EXPECTED_MAGIC      = 0x43464E49; // "INFC"
 constexpr uint16_t EXPECTED_VERSION    = 1;
@@ -141,11 +151,13 @@ public:
     [[nodiscard]] inline float* data() noexcept { return m_data.data(); }
     [[nodiscard]] inline const float* data() const noexcept { return m_data.data(); }
 
-    [[nodiscard]] inline float* row(size_t r) noexcept { 
-        return m_data.data() + r * m_cols; 
+    [[nodiscard]] inline float* row(size_t r) noexcept {
+        assert(r < m_rows && "Tensor::row index out of bounds");
+        return m_data.data() + r * m_cols;
     }
-    [[nodiscard]] inline const float* row(size_t r) const noexcept { 
-        return m_data.data() + r * m_cols; 
+    [[nodiscard]] inline const float* row(size_t r) const noexcept {
+        assert(r < m_rows && "Tensor::row index out of bounds");
+        return m_data.data() + r * m_cols;
     }
 
     /**
@@ -208,7 +220,7 @@ public:
         if (INFERC_UNLIKELY(out.m_rows != M || out.m_cols != N)) {
             out.resize(M, N, 0.0f);
         } else if (M * N > 0) {
-            std::memset(out.data(), 0, M * N * sizeof(float));
+            std::fill(out.data(), out.data() + (M * N), 0.0f);
         }
 
         if (M == 0 || K == 0 || N == 0) {
@@ -234,7 +246,7 @@ public:
                 const float* const INFERC_RESTRICT b2 = other_ptr + (k + 2) * N;
                 const float* const INFERC_RESTRICT b3 = other_ptr + (k + 3) * N;
 
-                #pragma GCC ivdep
+                INFERC_IVDEP
                 for (size_t j = 0; j < N; ++j) {
                     res_row[j] += a0 * b0[j];
                     res_row[j] += a1 * b1[j];
@@ -246,7 +258,7 @@ public:
                 const float a_ik = a_row[k];
                 const float* const INFERC_RESTRICT other_row = other_ptr + k * N;
 
-                #pragma GCC ivdep
+                INFERC_IVDEP
                 for (size_t j = 0; j < N; ++j) {
                     res_row[j] += a_ik * other_row[j];
                 }
@@ -332,7 +344,7 @@ public:
                 const float* const INFERC_RESTRICT w2 = w_ptr + (k + 2) * N;
                 const float* const INFERC_RESTRICT w3 = w_ptr + (k + 3) * N;
 
-                #pragma GCC ivdep
+                INFERC_IVDEP
                 for (size_t j = 0; j < N; ++j) {
                     c_row[j] += a0 * w0[j];
                     c_row[j] += a1 * w1[j];
@@ -344,7 +356,7 @@ public:
                 const float a_ik = a_row[k];
                 const float* const INFERC_RESTRICT w_row = w_ptr + k * N;
 
-                #pragma GCC ivdep
+                INFERC_IVDEP
                 for (size_t j = 0; j < N; ++j) {
                     c_row[j] += a_ik * w_row[j];
                 }
@@ -382,7 +394,7 @@ public:
 
         for (size_t i = 0; i < rows_count; ++i) {
             float* const INFERC_RESTRICT row_ptr = this_ptr + i * cols_count;
-            #pragma GCC ivdep
+            INFERC_IVDEP
             for (size_t j = 0; j < cols_count; ++j) {
                 row_ptr[j] += bias_ptr[j];
             }
@@ -410,6 +422,11 @@ public:
      * Deserializes layer parameters from stream with transactional commit semantics.
      */
     void load_weights(std::istream& is) {
+        const uint16_t endian_probe = 0x0102;
+        const auto* endian_bytes = reinterpret_cast<const uint8_t*>(&endian_probe);
+        if (endian_bytes[0] != 0x02 || endian_bytes[1] != 0x01) {
+            throw std::runtime_error("Unsupported host byte order: InferC binary deserialization requires a little-endian host.");
+        }
         if (!is.good()) {
             throw std::runtime_error("Weight input stream is not open or in an invalid state.");
         }
@@ -541,7 +558,7 @@ namespace activation {
         float* const INFERC_RESTRICT ptr = t.data();
         const size_t total_size = t.size();
 
-        #pragma GCC ivdep
+        INFERC_IVDEP
         for (size_t i = 0; i < total_size; ++i) {
             const float val = ptr[i];
             ptr[i] = (val > 0.0f) ? val : (std::isnan(val) ? val : 0.0f);
@@ -614,7 +631,7 @@ namespace activation {
             }
 
             float sum_exp = 0.0f;
-            #pragma GCC ivdep
+            INFERC_IVDEP
             for (size_t j = 0; j < cols_count; ++j) {
                 const float val = row[j];
                 if (val == -std::numeric_limits<float>::infinity()) {
@@ -633,7 +650,7 @@ namespace activation {
                 }
             } else {
                 const float inv_sum = 1.0f / sum_exp;
-                #pragma GCC ivdep
+                INFERC_IVDEP
                 for (size_t j = 0; j < cols_count; ++j) {
                     row[j] *= inv_sum;
                 }

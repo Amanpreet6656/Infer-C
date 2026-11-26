@@ -1,4 +1,4 @@
-﻿# Compiler settings - standard C++17
+# Compiler settings - standard C++17
 CXX ?= g++
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra -pedantic -Wno-unused-parameter
 PYTHON ?= python3
